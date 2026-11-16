@@ -182,6 +182,36 @@ describe("bridge client", () => {
         }
     });
 
+    test("remote bridge authenticates before sharing the tool list", async () => {
+        const tokens = new Map<string, string>();
+        rs.stubGlobal("window", {
+            sessionStorage: {
+                getItem: (key: string) => tokens.get(key) ?? null,
+                setItem: (key: string, value: string) => { tokens.set(key, value); },
+            },
+            prompt: () => "pairing-test-token",
+        });
+        const stop = connectBridge("wss://cad.example.com/ws");
+        try {
+            const socket = FakeSocket.instances[0];
+            expect(socket.url).toBe("wss://cad.example.com/ws");
+            socket.open();
+            expect(JSON.parse(socket.sent[0])).toEqual({ type: "auth", token: "pairing-test-token" });
+            expect(lastStatus()).toBe("retrying");
+            socket.receive({ type: "call", id: "1", name: "get_document_state", args: {} });
+            await delay(20);
+            expect(socket.sent).toHaveLength(1);
+            socket.receive({ type: "authenticated" });
+            await waitFor(() => socket.sent.length === 2);
+            const hello = JSON.parse(socket.sent[1]);
+            expect(hello.type).toBe("hello");
+            expect(hello.tools.some((tool: { name: string }) => tool.name === "run_program")).toBe(true);
+            expect(lastStatus()).toBe("connected");
+        } finally {
+            stop();
+        }
+    });
+
     test("stop clears the status and a late close does not restore it", async () => {
         const stop = connectBridge(17999);
         const socket = FakeSocket.instances[0];

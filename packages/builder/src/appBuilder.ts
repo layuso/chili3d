@@ -150,14 +150,14 @@ export class AppBuilder {
      */
     protected async connectBridge(): Promise<void> {
         if (!new URLSearchParams(window.location.search).has("bridge")) return;
-        const { bridgePortFromUrl, connectBridge } = await import("@chili3d/ai");
-        const port = bridgePortFromUrl(window.location.search);
-        if (port === undefined) {
+        const { bridgeTargetFromUrl, connectBridge } = await import("@chili3d/ai");
+        const target = bridgeTargetFromUrl(window.location.search);
+        if (target === undefined) {
             // A typo in the parameter would otherwise look like "the bridge is not running".
-            Logger.warn("ignoring an invalid ?bridge value; it must be a port number");
+            Logger.warn("ignoring an invalid ?bridge value; provide a local port or a secure wss://.../ws URL");
             return;
         }
-        connectBridge(port);
+        connectBridge(target);
     }
 
     protected async loadDefaultPlugins(app: IApplication) {
