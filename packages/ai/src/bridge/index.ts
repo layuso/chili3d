@@ -23,9 +23,11 @@ const RETRY_DELAYS = [500, 1000, 2000, 4000, 8000];
  * page took the bridge, 4003 for a protocol mismatch or a missing hello. Retrying those turns two
  * open tabs into a replacement loop, so the client stops instead.
  */
-const TERMINAL_CODES = new Set([4002, 4003]);
+const TERMINAL_CODES = new Set([4001, 4002, 4003]);
 
-type ServerMessage = { type: "call"; id: string; name: string; args?: Record<string, unknown> };
+type ServerMessage =
+    | { type: "call"; id: string; name: string; args?: Record<string, unknown> }
+    | { type: "authenticated" };
 
 /** A mixed-content block is thrown synchronously by the `WebSocket` constructor. */
 function isSecurityError(error: unknown): boolean {
@@ -34,10 +36,12 @@ function isSecurityError(error: unknown): boolean {
     );
 }
 
-function titleOf(status: BridgeStatus, port: number, detail?: string): string {
+function titleOf(status: BridgeStatus, target: number | string, detail?: string): string {
     switch (status) {
         case "connected":
-            return `Connected to the local bridge on 127.0.0.1:${port}`;
+            return typeof target === "number"
+                ? `Connected to the local bridge on 127.0.0.1:${target}`
+                : `Connected to the remote bridge at ${new URL(target).host}`;
         case "retrying":
             return "Reconnecting to the local bridge";
         case "blocked":
@@ -62,9 +66,25 @@ export function bridgePortFromUrl(search: string): number | undefined {
     return port > 0 && port <= 65535 ? port : undefined;
 }
 
+/** Only secure remote WebSocket URLs without embedded credentials are accepted. */
+export function bridgeTargetFromUrl(search: string): number | string | undefined {
+    const raw = new URLSearchParams(search).get("bridge");
+    if (raw === null) return undefined;
+    if (!raw.startsWith("wss://")) return bridgePortFromUrl(search);
+    try {
+        const url = new URL(raw);
+        if (url.protocol !== "wss:" || url.username || url.password || url.search || url.hash || url.pathname !== "/ws") {
+            return undefined;
+        }
+        return url.toString();
+    } catch {
+        return undefined;
+    }
+}
+
 /** Start the client; the returned function stops it. */
-export function connectBridge(port: number): () => void {
-    const client = new BridgeClient(port);
+export function connectBridge(target: number | string): () => void {
+    const client = new BridgeClient(target);
     client.start();
     return () => client.stop();
 }
@@ -75,15 +95,28 @@ class BridgeClient {
     private retry?: ReturnType<typeof setTimeout>;
     private attempts = 0;
     private stopped = false;
+    private remoteToken?: string;
+    private authenticated = false;
     /**
      * The daemon already sends one call at a time; this keeps the page correct for any sender and
      * keeps a rejected `receive` from escaping as an unhandled rejection.
      */
     private queue: Promise<void> = Promise.resolve();
 
-    constructor(private readonly port: number) {}
+    constructor(private readonly target: number | string) {}
 
     start(): void {
+        if (typeof this.target === "string") {
+            const key = `chili3d:bridge-token:${new URL(this.target).host}`;
+            const saved = window.sessionStorage.getItem(key);
+            const token = saved || window.prompt("Enter the Chili3D remote bridge pairing secret:");
+            if (!token) {
+                this.setStatus("closed", "pairing was cancelled");
+                return;
+            }
+            this.remoteToken = token;
+            window.sessionStorage.setItem(key, token);
+        }
         this.setStatus("retrying");
         this.connect();
     }
@@ -99,7 +132,7 @@ class BridgeClient {
         if (this.stopped) return;
         let socket: WebSocket;
         try {
-            socket = new WebSocket(`ws://127.0.0.1:${this.port}/ws`);
+            socket = new WebSocket(typeof this.target === "number" ? `ws://127.0.0.1:${this.target}/ws` : this.target);
         } catch (error) {
             // A page served over HTTPS gets a synchronous SecurityError when the browser refuses
             // an insecure WebSocket. Left uncaught, it would escape `AppBuilder.build()` and the
@@ -111,13 +144,19 @@ class BridgeClient {
         this.socket = socket;
         socket.addEventListener("open", () => {
             this.attempts = 0;
-            this.send({ type: "hello", protocol: PROTOCOL, tools: this.host.list() });
-            this.setStatus("connected");
+            if (this.remoteToken) {
+                // Do not expose modeling tools until the remote bridge authenticates.
+                this.send({ type: "auth", token: this.remoteToken });
+            } else {
+                this.send({ type: "hello", protocol: PROTOCOL, tools: this.host.list() });
+                this.setStatus("connected");
+            }
         });
         socket.addEventListener("message", (event) => {
             this.queue = this.queue.then(() => this.receive(String(event.data))).catch(() => undefined);
         });
         socket.addEventListener("close", (event) => {
+            this.authenticated = false;
             if (this.stopped) return;
             if (TERMINAL_CODES.has(event.code)) {
                 this.setStatus(event.code === 4002 ? "replaced" : "closed", event.reason);
@@ -142,7 +181,14 @@ class BridgeClient {
         } catch {
             return;
         }
+        if (message.type === "authenticated" && this.remoteToken) {
+            this.authenticated = true;
+            this.send({ type: "hello", protocol: PROTOCOL, tools: this.host.list() });
+            this.setStatus("connected");
+            return;
+        }
         if (message.type !== "call") return;
+        if (this.remoteToken && !this.authenticated) return;
 
         try {
             this.send({
@@ -162,6 +208,6 @@ class BridgeClient {
 
     private setStatus(status: BridgeStatus, detail?: string): void {
         if (this.stopped) return;
-        PubSub.default.pub("bridgeStatusChanged", status, titleOf(status, this.port, detail));
+        PubSub.default.pub("bridgeStatusChanged", status, titleOf(status, this.target, detail));
     }
 }
